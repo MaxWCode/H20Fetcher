@@ -1,4 +1,4 @@
-module github.com/MaxWCode/H20Fetcher
+module github.com/MaxWCode/TappedIN
 
 go 1.23.0
 
