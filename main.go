@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,58 +30,228 @@ type AjaxResponse struct {
 	Data string `json:"data"`
 }
 
+// Progress tracks the current state of processing
+type Progress struct {
+	LastFile     string `json:"last_file"`     // Last CSV file processed
+	LastPostcode string `json:"last_postcode"` // Last postcode processed
+	Completed    bool   `json:"completed"`     // Whether all processing is complete
+}
+
 const (
-	maxRetries    = 3                     // Maximum number of retries for failed requests
-	maxGoroutines = 100                   // Maximum number of concurrent goroutines
-	postcodeFile  = "CSV/postcodesss.csv" // CSV file containing postcodes
+	maxRetries    = 3
+	maxGoroutines = 3
+	postcodeDir   = "ALLCODECSV"
+	progressFile  = "progress.json"
+	resultsFile   = "water_suppliers_results.json"
 )
 
-// main function
-func main() {
-	// Get all postcodes from the CSV file
-	postcodes, err := getPostcodesFromCSV(postcodeFile)
+// loadProgress loads the current progress from the progress file
+func loadProgress() (*Progress, error) {
+	data, err := os.ReadFile(progressFile)
 	if err != nil {
-		log.Fatalf("Error reading CSV file: %v", err)
+		if os.IsNotExist(err) {
+			// If file doesn't exist, return new progress
+			return &Progress{}, nil
+		}
+		return nil, fmt.Errorf("error reading progress file: %v", err)
 	}
 
-	// Channel to collect results from multiple Go routines
-	resultsChan := make(chan PostcodeResult, len(postcodes))
-
-	// WaitGroup to wait for all Go routines to finish
-	var wg sync.WaitGroup
-
-	// Create a guard channel to limit concurrent goroutines
-	guard := make(chan struct{}, maxGoroutines)
-
-	// Spawn a Go routine for each postcode
-	for _, postcode := range postcodes {
-		wg.Add(1)
-		go func(postcode string) {
-			defer wg.Done()
-			// Acquire a spot in the guard channel
-			guard <- struct{}{}
-			defer func() { <-guard }() // Release the spot when done
-
-			// Perform the request with retries and get the supplier information
-			result := getSupplierForPostcodeWithRetries(postcode, maxRetries)
-			resultsChan <- result
-		}(postcode)
+	var progress Progress
+	if err := json.Unmarshal(data, &progress); err != nil {
+		return nil, fmt.Errorf("error parsing progress file: %v", err)
 	}
 
-	// Wait for all Go routines to finish and close the results channel
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
+	return &progress, nil
+}
 
-	// Collect all results into a slice
+// saveProgress saves the current progress to the progress file
+func saveProgress(progress *Progress) error {
+	data, err := json.MarshalIndent(progress, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error marshalling progress: %v", err)
+	}
+
+	if err := os.WriteFile(progressFile, data, 0644); err != nil {
+		return fmt.Errorf("error writing progress file: %v", err)
+	}
+
+	return nil
+}
+
+// loadExistingResults loads any existing results from the results file
+func loadExistingResults() ([]PostcodeResult, error) {
+	data, err := os.ReadFile(resultsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []PostcodeResult{}, nil
+		}
+		return nil, fmt.Errorf("error reading results file: %v", err)
+	}
+
 	var results []PostcodeResult
-	for result := range resultsChan {
-		results = append(results, result)
+	if err := json.Unmarshal(data, &results); err != nil {
+		return nil, fmt.Errorf("error parsing results file: %v", err)
 	}
 
-	// Save results to a JSON file
-	saveResultsToJSON(results, "water_suppliers_results.json")
+	return results, nil
+}
+
+func main() {
+	// Load progress from previous run
+	progress, err := loadProgress()
+	if err != nil {
+		log.Fatalf("Error loading progress: %v", err)
+	}
+
+	// Load any existing results
+	existingResults, err := loadExistingResults()
+	if err != nil {
+		log.Fatalf("Error loading existing results: %v", err)
+	}
+
+	// Create a map of processed postcodes for quick lookup
+	processedPostcodes := make(map[string]bool)
+	for _, result := range existingResults {
+		processedPostcodes[result.Postcode] = true
+	}
+
+	// Get list of CSV files
+	files, err := filepath.Glob(filepath.Join(postcodeDir, "*.csv"))
+	if err != nil {
+		log.Fatalf("Error reading directory: %v", err)
+	}
+
+	// Sort files to ensure consistent ordering
+	sort.Strings(files)
+
+	// Find starting point based on progress
+	startIdx := 0
+	if progress.LastFile != "" {
+		for i, file := range files {
+			if filepath.Base(file) == progress.LastFile {
+				startIdx = i
+				break
+			}
+		}
+	}
+
+	// Process each file from the last known position
+	var results []PostcodeResult
+	results = append(results, existingResults...)
+
+	for i := startIdx; i < len(files); i++ {
+		file := files[i]
+		filename := filepath.Base(file)
+		log.Printf("Processing file: %s", filename)
+
+		postcodes, err := getPostcodesFromCSV(file)
+		if err != nil {
+			log.Printf("Error reading CSV file %s: %v", file, err)
+			continue
+		}
+
+		// Find starting postcode in current file
+		startPostcodeIdx := 0
+		if filename == progress.LastFile && progress.LastPostcode != "" {
+			for j, pc := range postcodes {
+				if pc == progress.LastPostcode {
+					startPostcodeIdx = j + 1 // Start from the NEXT postcode
+					if startPostcodeIdx < len(postcodes) {
+						log.Printf("Resuming from postcode %s (after %s)", postcodes[startPostcodeIdx], pc)
+					}
+					break
+				}
+			}
+		}
+
+		// Create channels for concurrent processing
+		resultsChan := make(chan PostcodeResult, maxGoroutines)
+		errorsChan := make(chan error, maxGoroutines)
+		semaphore := make(chan struct{}, maxGoroutines)
+		var wg sync.WaitGroup
+
+		// Process postcodes with concurrent workers
+		for j := startPostcodeIdx; j < len(postcodes); j++ {
+			postcode := postcodes[j]
+
+			// Skip if already processed
+			if processedPostcodes[postcode] {
+				log.Printf("Skipping already processed postcode: %s", postcode)
+				continue
+			}
+
+			wg.Add(1)
+			semaphore <- struct{}{} // Acquire semaphore
+
+			go func(pc string, idx int) {
+				defer wg.Done()
+				defer func() { <-semaphore }() // Release semaphore
+
+				result := getSupplierForPostcodeWithRetries(pc, maxRetries)
+				resultsChan <- result
+
+				// Update progress
+				if idx > startPostcodeIdx {
+					progress.LastFile = filename
+					progress.LastPostcode = pc
+					if err := saveProgress(progress); err != nil {
+						errorsChan <- fmt.Errorf("error saving progress for postcode %s: %v", pc, err)
+					}
+				}
+			}(postcode, j)
+
+			// Wait for all goroutines to complete before moving to next batch
+			if j%maxGoroutines == maxGoroutines-1 || j == len(postcodes)-1 {
+				go func() {
+					wg.Wait()
+					close(resultsChan)
+				}()
+
+				// Collect results
+				for result := range resultsChan {
+					if result.Supplier != "" && result.Supplier != "Not Found" {
+						processedPostcodes[result.Postcode] = true
+						results = append(results, result)
+					}
+				}
+
+				// Save results periodically
+				if len(results)%10 == 0 {
+					saveResultsToJSON(results, resultsFile)
+				}
+
+				// Check for errors
+				select {
+				case err := <-errorsChan:
+					log.Printf("Error during processing: %v", err)
+				default:
+				}
+
+				// Reset channels for next batch
+				resultsChan = make(chan PostcodeResult, maxGoroutines)
+				errorsChan = make(chan error, maxGoroutines)
+			}
+		}
+
+		// Save results after completing each file
+		saveResultsToJSON(results, resultsFile)
+
+		// If we've completed a file, clear the last postcode
+		if i < len(files)-1 {
+			progress.LastPostcode = ""
+			if err := saveProgress(progress); err != nil {
+				log.Printf("Error saving progress: %v", err)
+			}
+		}
+	}
+
+	// Mark as completed
+	progress.Completed = true
+	if err := saveProgress(progress); err != nil {
+		log.Printf("Error saving final progress: %v", err)
+	}
+
+	log.Println("Processing completed successfully")
 }
 
 // getPostcodesFromCSV reads a single CSV file and extracts postcodes
@@ -105,8 +277,9 @@ func getPostcodesFromCSV(filePath string) ([]string, error) {
 			return nil, fmt.Errorf("error reading CSV file: %v", err)
 		}
 
-		// Add the postcode from the first column (assuming postcodes are in the first column)
-		postcodes = append(postcodes, record[0])
+		// Extract postcode from the first column and remove quotes if present
+		postcode := strings.Trim(record[0], "\"")
+		postcodes = append(postcodes, postcode)
 	}
 
 	return postcodes, nil
@@ -145,11 +318,11 @@ func getSupplierForPostcodeWithRetries(postcode string, retries int) PostcodeRes
 		fmt.Printf("[Postcode %s] Attempt %d: Extracted supplier: %s\n", postcode, i+1, result.Supplier)
 
 		// Wait before retrying
-		time.Sleep(2 * time.Second) // Optional: Wait before retrying
+		time.Sleep(2 * time.Second)
 	}
 
 	fmt.Printf("[Postcode %s] All attempts failed. Last result: %s\n", postcode, result.Supplier)
-	return result // Return the result after all retries
+	return result
 }
 
 // getSupplierForPostcode performs the POST request to get the supplier info for a given postcode
@@ -159,7 +332,7 @@ func getSupplierForPostcode(postcode string) PostcodeResult {
 	// Data payload for the POST request
 	formData := url.Values{
 		"postcode":                  {postcode},
-		"form_build_id":             {"form-L5pD8ZkLBHXVZ8bFpzrd3oIEPn94DYlRz298X2_IG1s"}, // Adjust as necessary
+		"form_build_id":             {"form-L5pD8ZkLBHXVZ8bFpzrd3oIEPn94DYlRz298X2_IG1s"},
 		"form_id":                   {"wateruk_find_my_supplier"},
 		"_triggering_element_name":  {"op"},
 		"_triggering_element_value": {"Submit"},
@@ -208,7 +381,7 @@ func getSupplierForPostcode(postcode string) PostcodeResult {
 	}
 
 	// Extract supplier details from the HTML in the data field
-	supplier := extractSupplierDetails(ajaxResponse[2].Data) // Assuming the third item contains the required HTML
+	supplier := extractSupplierDetails(ajaxResponse[2].Data)
 	fmt.Printf("[Postcode %s] Extracted Results: %s...\n", postcode, supplier["link"])
 	return PostcodeResult{
 		Postcode: postcode,
